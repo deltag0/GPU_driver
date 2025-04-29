@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+&{/reserved-memory} {
+    my_mem: test-mem@90000000 {
+        compatible = "shared-dma-pool";
+        reg = <0x0 0x90000000 0x10000>; // 64 KB, now with 3 cells
+        no-map;
+    };
+};
+
+&{/soc} {
+    test_device: test-device@12340000 {
+        compatible = "pi_gpu";
+        reg = <0x0 0x12340000 0x1000>; // now with 3 cells
+        memory-region = <&my_mem>;
+        status = "okay";
+    };
+};
