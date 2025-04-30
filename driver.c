@@ -43,6 +43,7 @@ MODULE_AUTHOR("Victor");
 MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 
 #define GPU_ID 0x0000 // temporary offset for the ID register for now
+
 #define PI_MAX_PITCH                                                           \
   (0x1FF << 3) /* (4096 - 1) & ~111b bytes                                     \
                 = 4088. It's made sure that it's a multiple of 8 for easier    \
@@ -53,12 +54,21 @@ MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 
 
 struct gpu_render_args {
-  u32 handle;
-  u32 width;
-  u32 height;
-  u32 x;
-  u32 y;
+  /*
+   * We're using __u32 instead of u32 because __u32 is compatible (and signifies it interacts with user-space)
+   *
+   * Not a realistic structure, but want to keep it simple for this driver
+   */ 
+  __u32 x;
+  __u32 y;
+  __u32 width;
+  __u32 height;
+  __u32 color;
+  __u32 handle;
 };
+
+
+#define DRM_IOCTL_RENDER 0x00
 
 
 // NOTE: We only need to define our cutom iocts like this.
@@ -66,7 +76,7 @@ struct gpu_render_args {
 // Non-custom ioctls aren't added there. For example dumb_create is a callback from an ioctl which
 // help us create GEM object (and returns a GEM object handler)
 #define DRM_IOCTL_RENDER_IOCTL \
-  DRM_IOWR(0xAB, struct gpu_render_args)
+  DRM_IOWR(DRM_COMMAND_BASE + DRM_IOCTL_RENDER, struct gpu_render_args)
 
 
 struct pi_gpu;
@@ -95,6 +105,8 @@ static const struct drm_driver pi_gpu_driver = {
 
     /* SHMEM isshared memory, I think it's for RAM
      * This function returns the handle of the GEM object created
+     *
+     * shmem isn't guaranteed to be continuous, it's not allocated by the CMA
      */ 
     .dumb_create = drm_gem_shmem_dumb_create,
     // some more things down below I need to learn about
@@ -220,7 +232,8 @@ struct pi_gpu *to_gpu(struct drm_device *drm) {
  */ 
 int gpu_render_ioctl(struct drm_device *dev, void *data, struct drm_file *file) {
   struct pi_gpu *gpu = to_gpu(dev);
-  // TODO:
+  struct gpu_render_args *render_args = data; 
+
   return 0;
 }
 
@@ -1238,6 +1251,15 @@ NOTE: https://www.kernel.org/doc/html/v4.14/gpu/drm-uapi.html | This is how driv
 
 #NOTE: in fact, here's a quote from a linux documentation for a driver: 
  "The Intel GPU family is a family of integrated GPU's using Unified Memory Access. For having the GPU "do work", user space will feed the GPU batch buffers via one of the ioctls DRM_IOCTL_I915_GEM_EXECBUFFER2 or DRM_IOCTL_I915_GEM_EXECBUFFER2_WR"
+
+
+#NOTE: This is pretty important about the atomic framework and something I had mistaken
+
+The atomic framework doesn't copy any frame buffers, or anything. It does NOT create any atomic STATE. This is left to the user space. In fact, there is a "strategy" called double buffering which is pretty simple.
+The principle is that there's 2 BO, one used for the current display, what the user sees, and one that gets updated. During VBlank, usually (or other suitable time? if there is any, not sure), the userspace calls an atomic commit with the second buffer. If they want to modify other things than the framebuffers or planes, FIXME: I believe that requires a full modeset
+
+Moreover, a Buffer Object (BO) is (kind of obviously) different from a frame buffer or the such. The BO, is really just the memory allocated for it, and the framebuffer contains important metadata about the pixels such as the format, the width, pitch, etc.
+
 
  *https://www.kernel.org/doc/html/v5.7/driver-api/driver-model/index.html
  *https://docs.kernel.org/5.17/gpu/drm-internals.html#c.devm_drm_dev_alloc
