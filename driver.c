@@ -45,6 +45,7 @@ MODULE_AUTHOR("Victor");
 MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 
 #define GPU_ID 0x0000 // temporary offset for the ID register for now
+#define BUFFER_OFFSET 0x1000
 
 #define PI_MAX_PITCH                                                           \
   (0x1FF << 3) /* (4096 - 1) & ~111b bytes                                     \
@@ -139,7 +140,7 @@ struct pi_gpu {
   // TODO: I'm just pointing to the beginning of the allocated RAM memory (see
   // below on why it's RAM) so I'll have to add an offset when allocating the
   // RAM memory for the device
-  u32 *vram;
+  u64 *vram;
   size_t vram_size;
   struct clk *clk;
 
@@ -226,6 +227,10 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
   struct pi_gpu *gpu = to_gpu(dev);
   struct gpu_render_args *render_args = data;
   struct page **pages;
+  struct sg_table *table;
+
+  struct iosys_map *bo_va;
+  size_t bo_size = 0;
   int ret;
 
   u32 handle = render_args->handle;
@@ -235,19 +240,40 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
   if (IS_ERR(obj))
     return -EINVAL;
 
-  // This pins the pages in memory, so we don't have to worry about this moving
-  // while we use them Need to release them once we're done
-  pages = drm_gem_get_pages(obj);
+  struct drm_gem_shmem_object *shmem_obj = to_drm_gem_shmem_obj(obj);
 
-  if (IS_ERR(pages))
-    return -ENODEV;
+  if (IS_ERR(shmem_obj))
+    return -EINVAL;
 
-  if (obj->dev != dev)
+  bo_size = shmem_obj->base.size;
+  // This pins the pages into memory
+  ret = drm_gem_shmem_vmap(shmem_obj, bo_va);
+
+  if (ret)
+    return ret;
+
+  if (bo_va->is_iomem) {
+    printk(KERN_CRIT "Not supposed to be io mem\n");
+    goto release;
+  }
+  else {
+    printk(KERN_INFO "Correctly mapped Buffer Object\n");
+  }
+
+  if (obj->dev != dev) {
     ret = -ENODEV;
     goto release;
+  }
+
+  for (int i = 0; i < bo_size; i++) {
+    u8 *va = bo_va->vaddr;
+    unsigned long addr = (unsigned long)(va + i);
+    *(gpu->vram + BUFFER_OFFSET + i) = addr; 
+  }
+
 
 release:
-  drm_gem_put_pages(obj, pages, true, false);
+  drm_gem_shmem_vunmap(shmem_obj, bo_va);
 
   return ret;
 }
@@ -259,7 +285,7 @@ release:
 int gpu_gem_create_ioctl(struct drm_device *dev, void *data,
                          struct drm_file *file) {
   struct pi_gpu *gpu = to_gpu(dev);
-  u32 *starting_mr = gpu->vram;
+  u64 *starting_mr = gpu->vram;
 }
 
 // -------------------------------------------------
