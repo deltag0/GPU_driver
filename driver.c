@@ -10,6 +10,7 @@
 #include "drm/drm_format_helper.h"
 #include "drm/drm_fourcc.h"
 #include "drm/drm_framebuffer.h"
+#include "drm/drm_gem.h"
 #include "drm/drm_gem_atomic_helper.h"
 #include "drm/drm_gem_framebuffer_helper.h"
 #include "drm/drm_gem_shmem_helper.h"
@@ -37,6 +38,7 @@
 #include "linux/uaccess.h"
 #include "linux/workqueue.h"
 #include <linux/platform_device.h>
+#include <stddef.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Victor");
@@ -52,13 +54,13 @@ MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 #define PI_MAX_VRAM                                                            \
   (4 * 1024 * 1024) /* 4MB since 1024 bytes is a KB and 1024 KB is a MB */
 
-
 struct gpu_render_args {
   /*
-   * We're using __u32 instead of u32 because __u32 is compatible (and signifies it interacts with user-space)
+   * We're using __u32 instead of u32 because __u32 is compatible (and signifies
+   * it interacts with user-space)
    *
    * Not a realistic structure, but want to keep it simple for this driver
-   */ 
+   */
   __u32 x;
   __u32 y;
   __u32 width;
@@ -67,30 +69,27 @@ struct gpu_render_args {
   __u32 handle;
 };
 
-
-#define DRM_IOCTL_RENDER 0x00
-
+#define DRM_IOCTL_EXC_BUFFER 0x00
 
 // NOTE: We only need to define our cutom iocts like this.
-// So all the ioctls in the .iocts field in drm_driver are custom ones, WE created
-// Non-custom ioctls aren't added there. For example dumb_create is a callback from an ioctl which
-// help us create GEM object (and returns a GEM object handler)
-#define DRM_IOCTL_RENDER_IOCTL \
-  DRM_IOWR(DRM_COMMAND_BASE + DRM_IOCTL_RENDER, struct gpu_render_args)
-
+// So all the ioctls in the .iocts field in drm_driver are custom ones, WE
+// created Non-custom ioctls aren't added there. For example dumb_create is a
+// callback from an ioctl which help us create GEM object (and returns a GEM
+// object handler)
+#define DRM_IOCTL_EXC_BUFFER_IOCTL                                             \
+  DRM_IOWR(DRM_COMMAND_BASE + DRM_IOCTL_EXC_BUFFER, struct gpu_render_args)
 
 struct pi_gpu;
 static int probe_fake_gpu(struct platform_device *);
 static int remove_fake_gpu(struct platform_device *);
-static void pi_format_set(struct pi_gpu *gpu, const struct drm_format_info *format);
+static void pi_format_set(struct pi_gpu *gpu,
+                          const struct drm_format_info *format);
 int gpu_render_ioctl(struct drm_device *dev, void *data, struct drm_file *file);
 
-
 static const struct drm_ioctl_desc ioctl_funcs[] = {
-  DRM_IOCTL_DEF_DRV(RENDER_IOCTL, gpu_render_ioctl, DRM_RENDER_ALLOW),
-  // TODO: more if needed
+    DRM_IOCTL_DEF_DRV(EXC_BUFFER_IOCTL, gpu_render_ioctl, DRM_RENDER_ALLOW),
+    // TODO: more if needed
 };
-
 
 static const struct drm_driver pi_gpu_driver = {
     .driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER,
@@ -107,7 +106,7 @@ static const struct drm_driver pi_gpu_driver = {
      * This function returns the handle of the GEM object created
      *
      * shmem isn't guaranteed to be continuous, it's not allocated by the CMA
-     */ 
+     */
     .dumb_create = drm_gem_shmem_dumb_create,
     // some more things down below I need to learn about
 };
@@ -141,6 +140,7 @@ struct pi_gpu {
   // below on why it's RAM) so I'll have to add an offset when allocating the
   // RAM memory for the device
   u32 *vram;
+  size_t vram_size;
   struct clk *clk;
 
   struct drm_plane primary_plane;
@@ -185,39 +185,30 @@ So, we'll be intercepting GPU calls ourselves. :( Not a real GPU I know
 ------------------------------------------------------
 */
 
-static u8 reg_read8_ioctl(struct file *file, unsigned int cmd, u8 data, u64 offset) {
+static u8 reg_read8_ioctl(struct file *file, unsigned int cmd, u8 data,
+                          u64 offset) {
   return 0;
 }
 
-static u16 reg_read16_ioctl(u16 data, u64 offset) {
-  return 0;
-}
+static u16 reg_read16_ioctl(u16 data, u64 offset) { return 0; }
 
-static u32 reg_read32_ioctl(u32 data, u64 offset) {
-  return 0;
-}
+static u32 reg_read32_ioctl(u32 data, u64 offset) { return 0; }
 
-static void reg_write8_ioctl(u8 data, u64 offset) {
-  ;
-}
+static void reg_write8_ioctl(u8 data, u64 offset) { ; }
 
-static void reg_write16_ioctl(u16 data, u64 offset) {
-  ;
-}
+static void reg_write16_ioctl(u16 data, u64 offset) { ; }
 
-static void reg_write32_ioctl(u32 data, u64 offset) {
-  ;
-}
-
+static void reg_write32_ioctl(u32 data, u64 offset) { ; }
 
 struct pi_gpu *to_gpu(struct drm_device *drm) {
   return container_of_const(drm, struct pi_gpu, drm_device);
 }
 
-
 /*
- * data argument is a pointer that the kernel already converted for us into the kernel address space
- * (by doing copy_from_user). So we can cast it to a struct we defined in user-space (that's also defined)
+ * data argument is a pointer that the kernel already converted for us into the
+ kernel address space
+ * (by doing copy_from_user). So we can cast it to a struct we defined in
+ user-space (that's also defined)
  * in the kernel module.
  * e.g.
  *struct drm_my_ioctl_args {
@@ -225,35 +216,51 @@ struct pi_gpu *to_gpu(struct drm_device *drm) {
     __u32 width;
     __u32 height;
   };
- * 
+ *
  * And we do what we need with that
- * 
+ *
  * Probably won't touch the drm_file
- */ 
-int gpu_render_ioctl(struct drm_device *dev, void *data, struct drm_file *file) {
+ */
+int gpu_render_ioctl(struct drm_device *dev, void *data,
+                     struct drm_file *file) {
   struct pi_gpu *gpu = to_gpu(dev);
-  struct gpu_render_args *render_args = data; 
+  struct gpu_render_args *render_args = data;
+  struct page **pages;
+  int ret;
 
-  return 0;
+  u32 handle = render_args->handle;
+
+  struct drm_gem_object *obj = drm_gem_object_lookup(file, handle);
+
+  if (IS_ERR(obj))
+    return -EINVAL;
+
+  // This pins the pages in memory, so we don't have to worry about this moving
+  // while we use them Need to release them once we're done
+  pages = drm_gem_get_pages(obj);
+
+  if (IS_ERR(pages))
+    return -ENODEV;
+
+  if (obj->dev != dev)
+    ret = -ENODEV;
+    goto release;
+
+release:
+  drm_gem_put_pages(obj, pages, true, false);
+
+  return ret;
 }
-
 
 /*
  * Returns a handle to the GEM BO created
  *
- */ 
-int gpu_gem_create_ioctl(struct drm_device *dev, void *data, struct drm_file *file) {
+ */
+int gpu_gem_create_ioctl(struct drm_device *dev, void *data,
+                         struct drm_file *file) {
   struct pi_gpu *gpu = to_gpu(dev);
   u32 *starting_mr = gpu->vram;
-
-
-  
 }
-
-
-
-
-
 
 // -------------------------------------------------
 static const struct drm_mode_config_funcs fake_gpu_modecfg_funcs = {
@@ -408,9 +415,10 @@ pi_format(const struct drm_framebuffer *fb) {
  * Can also affect multiple crtcs
  *
  * NOTE: This is the atomic check pipeline:
- * First the modeset atomic check gets called whichdoes some checks, then we check the planes
- * In the plane atomic check, the check for CRTC is done (crtc_atomic_check is called at trhe very end)
- * So the CRTC knows all planes are individually correct, so it can check between plane compatibility, and
+ * First the modeset atomic check gets called whichdoes some checks, then we
+ * check the planes In the plane atomic check, the check for CRTC is done
+ * (crtc_atomic_check is called at trhe very end) So the CRTC knows all planes
+ * are individually correct, so it can check between plane compatibility, and
  * and can check resources common to all planes.
  *
  *
@@ -540,7 +548,7 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
  *
  *
  *-------------------------------------------------------------------------------
- */ 
+ */
 
 #define REG_FORMAT 0x04
 #define REG_PITCH 0x08
@@ -551,39 +559,35 @@ enum {
   PIX_FMT_XRGB8888 = 2,
 };
 
-static void pi_format_set(struct pi_gpu *gpu, const struct drm_format_info *format) {
+static void pi_format_set(struct pi_gpu *gpu,
+                          const struct drm_format_info *format) {
   u8 fmt;
 
   switch (format->format) {
-    case DRM_FORMAT_RGB565:
-      fmt = PIX_FMT_RGB565;
-      break;
-    case DRM_FORMAT_RGB888:
-      fmt = PIX_FMT_RGB888;
-      break;
-    case DRM_FORMAT_XRGB8888:
-      fmt = PIX_FMT_XRGB8888;
-      break;
-    default:
-      WARN(1, "Unsupported format: %08x\n", format->format); 
-      return;
-    }
+  case DRM_FORMAT_RGB565:
+    fmt = PIX_FMT_RGB565;
+    break;
+  case DRM_FORMAT_RGB888:
+    fmt = PIX_FMT_RGB888;
+    break;
+  case DRM_FORMAT_XRGB8888:
+    fmt = PIX_FMT_XRGB8888;
+    break;
+  default:
+    WARN(1, "Unsupported format: %08x\n", format->format);
+    return;
+  }
 
-  // TODO: important, I think we'll actually have to make our GPU with QEMU, otherwise, it's going to be hard
-  // as hell
+  // TODO: important, I think we'll actually have to make our GPU with QEMU,
+  // otherwise, it's going to be hard as hell
   iowrite8(fmt, gpu->registers + REG_FORMAT);
 }
-
 
 static void pi_pitch_set(struct pi_gpu *gpu, unsigned int pitch) {
   u16 reg_pitch = pitch;
 
   iowrite16(reg_pitch, gpu->registers + REG_PITCH);
 }
-
-
-
-
 
 /*
  * These are all the mandatory functions I need for my plane
@@ -625,10 +629,7 @@ static const struct drm_plane_helper_funcs pi_primary_plane_helper_funcs = {
     .atomic_update = pi_primary_plane_helper_atomic_update,
 };
 
-
-static struct drm_crtc_helper_funcs pi_crtc_helper_funcs = {
-};
-
+static struct drm_crtc_helper_funcs pi_crtc_helper_funcs = {};
 
 static const uint32_t pi_primary_plane_formats[] = {
     DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB888, DRM_FORMAT_RGB565};
@@ -637,16 +638,14 @@ static const uint64_t pi_primary_plane_modifiers[] = {
     DRM_FORMAT_MOD_LINEAR,
 };
 
-
 static const struct drm_crtc_funcs pi_crtc_funcs = {
-	.reset = drm_atomic_helper_crtc_reset,
-	.destroy = drm_crtc_cleanup,
-	.set_config = drm_atomic_helper_set_config,
-	.page_flip = drm_atomic_helper_page_flip,
-	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+    .reset = drm_atomic_helper_crtc_reset,
+    .destroy = drm_crtc_cleanup,
+    .set_config = drm_atomic_helper_set_config,
+    .page_flip = drm_atomic_helper_page_flip,
+    .atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+    .atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
 };
-
 
 static int pi_pipe_init(struct pi_gpu *gpu) {
   struct drm_device *drm = &gpu->drm_device;
@@ -660,12 +659,13 @@ static int pi_pipe_init(struct pi_gpu *gpu) {
    *
    * NOTE: DRM state structs are owned by the corresponding DRM object
    *
-   * NOTE: Before a commit is finised, the state is owned by the atomic_commit state
-   *       After it's finished, the state is owned by the object (and memory by the driver)
+   * NOTE: Before a commit is finised, the state is owned by the atomic_commit
+   * state After it's finished, the state is owned by the object (and memory by
+   * the driver)
    *
    * If the atomic state owns a state, it can free it if it fails.
    * Usually 2 copies during an atomic operation
-   */ 
+   */
 
   /*
    * Initializing the primary plane
@@ -686,7 +686,8 @@ static int pi_pipe_init(struct pi_gpu *gpu) {
    * Plane modifiers -> change how the GPU's pixel data is stored/organized in
    * memory NOTE: We'll probably only do linear for this one.
    *
-   * NOTE: Planes are owned by the device, so it still exists if it has no framebuffers or are inactive
+   * NOTE: Planes are owned by the device, so it still exists if it has no
+   * framebuffers or are inactive
    */
   ret = drm_universal_plane_init(
       drm, &gpu->primary_plane, 0, &pi_primary_plane_funcs,
@@ -699,15 +700,17 @@ static int pi_pipe_init(struct pi_gpu *gpu) {
 
   /*
    * This enables tracking the damage rectangles for updating the output
-   */ 
+   */
   drm_plane_enable_fb_damage_clips(&gpu->primary_plane);
 
   /*
    * The first NULL is for the cursor plane
    *
-   * NOTE: CRTC is owned by the device, so still exists even if there's no planes pointing to it
-   */ 
-  ret = drmm_crtc_init_with_planes(drm, &gpu->crtc, &gpu->primary_plane, NULL, &pi_crtc_funcs, NULL);
+   * NOTE: CRTC is owned by the device, so still exists even if there's no
+   * planes pointing to it
+   */
+  ret = drmm_crtc_init_with_planes(drm, &gpu->crtc, &gpu->primary_plane, NULL,
+                                   &pi_crtc_funcs, NULL);
 
   if (ret) {
     return ret;
@@ -882,6 +885,7 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
 
   gpu->vram = dma_alloc_coherent(drm->dev, (size_t)vram_size, &dma_handle_vram,
                                  GFP_KERNEL);
+  gpu->vram_size = (size_t)vram_size;
 
   if (IS_ERR(gpu->vram)) {
     return PTR_ERR(gpu->vram);
@@ -954,8 +958,6 @@ static int probe_fake_gpu(struct platform_device *device) {
 }
 
 module_platform_driver(pi_connection_driver);
-
-
 
 /*
  * One of the usecases of Loadable Kernel Modules is for device drivers. LKM's
@@ -1128,14 +1130,17 @@ module_platform_driver(pi_connection_driver);
  * the orientation and the scaling factors. Contain information on how to
  blend
  *
- * Planes feed pixel output in the CRTC (reads pixel data from memory and "formats" it to provide it to display hardware). NOTE: The pixel data from memory is what a framebuffer represents
+ * Planes feed pixel output in the CRTC (reads pixel data from memory and
+"formats" it to provide it to display hardware). NOTE: The pixel data from
+memory is what a framebuffer represents
  *
  * CRTC -> controls everything related to display-mode settings.
  * display mode setting is the sepcific resolution, refresh rate and other
  parameters
  * planes are assigned to a CRTC I think
  *
- * NOTE: The crtc is the display pipeline. This display pipeline (CRTC) must be connected to a connector
+ * NOTE: The crtc is the display pipeline. This display pipeline (CRTC) must be
+connected to a connector
  *
  * compositors manage the planes and shit
  *
@@ -1147,8 +1152,8 @@ module_platform_driver(pi_connection_driver);
  output type (HDMI or VGA, etc)
   * understands
  *
- * Connector -> represents output (screen, it represents a SCREEN). Represents physical monitor.
- Also provides resolution color space and the like.
+ * Connector -> represents output (screen, it represents a SCREEN). Represents
+physical monitor. Also provides resolution color space and the like.
  *
  * Pipeline: Naive implementation -> Program display modein CRTC, upload
  buffer objects in graphics memory, set u framebuffers and planes, enable
@@ -1239,26 +1244,57 @@ module_platform_driver(pi_connection_driver);
 
 
 
-In the atomic framework, every KMS object related to the pipeline has a state (CRTC, Plane, Connector). During an atomic commit, they're owned by an atomic_state as we can see in the struct of
-the states. Once the atomic commit is done, it's ownership is released because it's no longer owned. Old state gets swapped with new state.
+In the atomic framework, every KMS object related to the pipeline has a state
+(CRTC, Plane, Connector). During an atomic commit, they're owned by an
+atomic_state as we can see in the struct of the states. Once the atomic commit
+is done, it's ownership is released because it's no longer owned. Old state gets
+swapped with new state.
 
 
-NOTE: https://www.kernel.org/doc/html/v4.14/gpu/drm-uapi.html | This is how drivers interact with the user space. They litewally have different ioctl functions for DRM WHICH I HAD THE OPPORTUNITY TO FIGURE THAT OUT FOR A WHILEEEEEEEE
+NOTE: https://www.kernel.org/doc/html/v4.14/gpu/drm-uapi.html | This is how
+drivers interact with the user space. They litewally have different ioctl
+functions for DRM WHICH I HAD THE OPPORTUNITY TO FIGURE THAT OUT FOR A
+WHILEEEEEEEE
 
 
-# NOTE: GPU rendering is actually triggered by IOCTL calls (or sys things calls, but usually ioctl) and that's how a GPU renders. When a GPU renders, what it does is it modifies the frame buffer that the driver owns. There's other things for device specific things IOCTL calls are used for, but this is really what we mean by rendering.
+# NOTE: GPU rendering is actually triggered by IOCTL calls (or sys things calls,
+but usually ioctl) and that's how a GPU renders. When a GPU renders, what it
+does is it modifies the frame buffer that the driver owns. There's other things
+for device specific things IOCTL calls are used for, but this is really what we
+mean by rendering.
 
 
-#NOTE: in fact, here's a quote from a linux documentation for a driver: 
- "The Intel GPU family is a family of integrated GPU's using Unified Memory Access. For having the GPU "do work", user space will feed the GPU batch buffers via one of the ioctls DRM_IOCTL_I915_GEM_EXECBUFFER2 or DRM_IOCTL_I915_GEM_EXECBUFFER2_WR"
+#NOTE: in fact, here's a quote from a linux documentation for a driver:
+ "The Intel GPU family is a family of integrated GPU's using Unified Memory
+Access. For having the GPU "do work", user space will feed the GPU batch buffers
+via one of the ioctls DRM_IOCTL_I915_GEM_EXECBUFFER2 or
+DRM_IOCTL_I915_GEM_EXECBUFFER2_WR"
 
 
-#NOTE: This is pretty important about the atomic framework and something I had mistaken
+#NOTE: This is pretty important about the atomic framework and something I had
+mistaken
 
-The atomic framework doesn't copy any frame buffers, or anything. It does NOT create any atomic STATE. This is left to the user space. In fact, there is a "strategy" called double buffering which is pretty simple.
-The principle is that there's 2 BO, one used for the current display, what the user sees, and one that gets updated. During VBlank, usually (or other suitable time? if there is any, not sure), the userspace calls an atomic commit with the second buffer. If they want to modify other things than the framebuffers or planes, FIXME: I believe that requires a full modeset
+The atomic framework doesn't copy any frame buffers, or anything. It does NOT
+create any atomic STATE. This is left to the user space. In fact, there is a
+"strategy" called double buffering which is pretty simple. The principle is that
+there's 2 BO, one used for the current display, what the user sees, and one that
+gets updated. During VBlank, usually (or other suitable time? if there is any,
+not sure), the userspace calls an atomic commit with the second buffer. If they
+want to modify other things than the framebuffers or planes, FIXME: I believe
+that requires a full modeset
 
-Moreover, a Buffer Object (BO) is (kind of obviously) different from a frame buffer or the such. The BO, is really just the memory allocated for it, and the framebuffer contains important metadata about the pixels such as the format, the width, pitch, etc.
+Moreover, a Buffer Object (BO) is (kind of obviously) different from a frame
+buffer or the such. The BO, is really just the memory allocated for it, and the
+framebuffer contains important metadata about the pixels such as the format, the
+width, pitch, etc.
+
+
+NOTE: PINNING PAGES
+First, the kernel allocated memory in pages, as we know and studied in our
+google doc. So, let's say we allocate some memory, a page is created for it and
+on hardware and the kernel might move the data from that page to another page
+which would cause problems. Pinning basically stops that from happening and the
+data in the page is forced to stay there.
 
 
  *https://www.kernel.org/doc/html/v5.7/driver-api/driver-model/index.html
