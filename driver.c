@@ -38,15 +38,14 @@
 #include "linux/uaccess.h"
 #include "linux/workqueue.h"
 #include <linux/platform_device.h>
-#include <stddef.h>
+
+#include "driver.h"
+#include "execbuffer.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Victor");
 MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 
-#define GPU_ID 0x0000 // temporary offset for the ID register for now
-#define BUFFER_OFFSET 0x1000
-#define BUFFER_LEN_OFFSET 0x1002
 
 #define PI_MAX_PITCH                                                           \
   (0x1FF << 3) /* (4096 - 1) & ~111b bytes                                     \
@@ -56,46 +55,6 @@ MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 #define PI_MAX_VRAM                                                            \
   (4 * 1024 * 1024) /* 4MB since 1024 bytes is a KB and 1024 KB is a MB */
 
-/*
- * Need to make sure these fields are aligned by 4 and 8 bytes
- */
-struct pi_exec_buffer {
-  __u64 buffers;     // pointer to buffer objects of type &pi_exec_buffer_obj
-  __u32 num_buffers; // number of buffer objects;
-                     // NOTE: Right now, only 2 buffers are supported. An
-                     // instruction buffer and frame buffer.
-
-  /* Offset from where we start execution from the instruction buffer (one of
-   * the submitted buffers). Usually 0.
-   */
-  __u32 instr_start_offset;
-
-  /* Length of how many instructions we want to execute from the instruction
-   * buffer from instr_start_offset. If specified as 0, the entire length of the
-   * buffer is executed.
-   */
-  __u32 instr_len;
-};
-
-struct pi_exec_buffer_obj {
-  /*
-   * GEM handle.
-   */
-  __u32 handle;
-
-  /*
-   * Flags for type of buffer.
-   */
-  __u8 flag;
-
-  __u8 padding[3]; // just in case
-};
-
-#define DRM_IOCTL_EXC_BUFFER 0x00
-
-#define get_64_lo(val) (val & 0xFFFFFFFF)
-
-#define get_64_hi(val) ((val >> 32) & 0xFFFFFFFF)
 
 // NOTE: We only need to define our cutom iocts like this.
 // So all the ioctls in the .iocts field in drm_driver are custom ones, WE
@@ -103,19 +62,20 @@ struct pi_exec_buffer_obj {
 // callback from an ioctl which help us create GEM object (and returns a GEM
 // object handler)
 #define DRM_IOCTL_EXC_BUFFER_IOCTL                                             \
-  DRM_IOWR(DRM_COMMAND_BASE + DRM_IOCTL_EXC_BUFFER, struct gpu_render_args)
+  DRM_IOWR(DRM_COMMAND_BASE + DRM_IOCTL_EXC_BUFFER, struct pi_exec_buffer)
 
 struct pi_gpu;
 static int probe_fake_gpu(struct platform_device *);
 static int remove_fake_gpu(struct platform_device *);
 static void pi_format_set(struct pi_gpu *gpu,
                           const struct drm_format_info *format);
-int gpu_render_ioctl(struct drm_device *dev, void *data, struct drm_file *file);
+
 
 static const struct drm_ioctl_desc ioctl_funcs[] = {
     DRM_IOCTL_DEF_DRV(EXC_BUFFER_IOCTL, gpu_render_ioctl, DRM_RENDER_ALLOW),
     // TODO: more if needed
 };
+
 
 static const struct drm_driver pi_gpu_driver = {
     .driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER,
@@ -151,29 +111,6 @@ static struct platform_driver pi_connection_driver = {
 
 };
 
-// This is the main device the driver will be for.
-// I defined it like this, it seems like it's just the basics for now
-// We'll see if we need to add any more things
-//
-// Our device definition wraps a drm_device which wraps a device
-// We get that device from a platform device wrapping the device
-//
-struct pi_gpu {
-  struct drm_device drm_device;
-  void __iomem *registers;
-
-  // TODO: I'm just pointing to the beginning of the allocated RAM memory (see
-  // below on why it's RAM) so I'll have to add an offset when allocating the
-  // RAM memory for the device
-  u32 *vram;
-  size_t vram_size;
-  struct clk *clk;
-
-  struct drm_plane primary_plane;
-  struct drm_connector connector;
-  struct drm_encoder encoder;
-  struct drm_crtc crtc;
-};
 
 #define to_pi(_dev) container_of(_dev, struct pi_gpu, drm_device)
 /*
@@ -230,115 +167,6 @@ struct pi_gpu *to_gpu(struct drm_device *drm) {
   return container_of_const(drm, struct pi_gpu, drm_device);
 }
 
-void process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
-                          struct pi_gpu *gpu) {
-  switch (flag) {
-  case 0x00:
-    break;
-  case 0x01:
-    *(gpu->vram + BUFFER_OFFSET) = get_64_lo(addr);
-    *(gpu->vram + BUFFER_OFFSET + 1) = get_64_hi(addr);
-    *(gpu->vram + BUFFER_LEN_OFFSET) = get_64_lo(size);
-    *(gpu->vram + BUFFER_LEN_OFFSET + 1) = get_64_hi(size);
-    break;
-  }
-}
-
-/*
- * data argument is a pointer that the kernel already converted for us into the
- kernel address space
- * (by doing copy_from_user). So we can cast it to a struct we defined in
- user-space (that's also defined)
- * in the kernel module.
- * e.g.
- *struct drm_my_ioctl_args {
-    __u32 some_cool_argument;
-  };
-
-  This function transforms data into a &pi_exec_buffer structure. That structure
- contains a list of pointers to shmem GEM buffer objects. This is similar to:
- &struct drm_i915_execbuffer2 defined in linux/include/uapi/drm/i915_drm.h An
- example of using the struct can be found in
- linux/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
- */
-int gpu_render_ioctl(struct drm_device *dev, void *data,
-                     struct drm_file *file) {
-  struct pi_gpu *gpu = to_gpu(dev);
-
-  if (IS_ERR(gpu))
-    return -ENODEV;
-
-  struct pi_exec_buffer *args = data;
-  struct page **pages;
-  struct sg_table *table;
-  struct drm_gem_shmem_object *shmem_obj;
-
-  struct iosys_map *bo_va;
-  size_t bo_size = 0;
-  int ret;
-  u32 handle;
-
-  u8 *va;
-  unsigned long addr;
-
-  size_t buffer_ptrs_size =
-      args->num_buffers * sizeof(struct pi_exec_buffer_obj);
-  struct pi_exec_buffer_obj *bo_ptr = kmalloc(buffer_ptrs_size, GFP_KERNEL);
-
-  if (IS_ERR(bo_ptr))
-    return -EINVAL;
-
-  ret =
-      copy_from_user(bo_ptr, u64_to_user_ptr(args->buffers), buffer_ptrs_size);
-
-  if (ret)
-    goto release;
-
-  for (int i = 0; i < args->num_buffers; i++) {
-    handle = (bo_ptr + i)->handle;
-    struct drm_gem_object *obj = drm_gem_object_lookup(file, handle);
-
-    if (IS_ERR(obj))
-      return -EINVAL;
-
-    shmem_obj = to_drm_gem_shmem_obj(obj);
-
-    if (IS_ERR(shmem_obj))
-      return -EINVAL;
-
-    bo_size = shmem_obj->base.size;
-    // This pins the pages into memory
-    ret = drm_gem_shmem_vmap(shmem_obj, bo_va);
-
-    if (ret)
-      return ret;
-
-    if (bo_va->is_iomem) {
-      printk(KERN_CRIT "Not supposed to be io mem\n");
-      goto unmap_release;
-    }
-
-    printk(KERN_INFO "Correctly mapped Buffer Object\n");
-
-    if (obj->dev != dev) {
-      ret = -ENODEV;
-      goto unmap_release;
-    }
-
-    va = bo_va->vaddr;
-    addr = (unsigned long)va;
-
-    process_gem_exec_obj(addr, bo_size, bo_ptr->flag, gpu);
-  }
-
-  // execute_bfr();
-unmap_release:
-  drm_gem_shmem_vunmap(shmem_obj, bo_va);
-release:
-  kfree(bo_ptr);
-
-  return ret;
-}
 
 // -------------------------------------------------
 static const struct drm_mode_config_funcs fake_gpu_modecfg_funcs = {

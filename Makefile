@@ -1,7 +1,8 @@
 # Kernel module Makefile
 
 # Target modules
-obj-m += driver.o
+obj-m += gpu_driver.o
+gpu_driver-objs := driver.o execbuffer.o
 
 # Detect the current kernel version
 KERNEL_VERSION ?= $(shell uname -r)
