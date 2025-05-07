@@ -124,8 +124,6 @@ static struct platform_driver pi_connection_driver = {
 struct pi_primary_plane_state {
   struct drm_shadow_plane_state base;
 
-  // These seem to be helper fields for rendering or
-  // different things about the interactions wth the frambuffer (NOT SURE YET)
   const struct drm_format_info *format;
 
   // The pitch is NOTE: the number of bytes between the start of one line of

@@ -15,8 +15,10 @@
 #include "linux/err.h"
 #include "linux/gfp_types.h"
 #include "linux/iosys-map.h"
+#include "linux/kern_levels.h"
 #include "linux/kernel.h"
 #include "linux/printk.h"
+#include "linux/rcupdate.h"
 #include "linux/slab.h"
 #include "linux/uaccess.h"
 #include <linux/platform_device.h>
@@ -27,8 +29,11 @@
 #define INS_OBJ 0x00
 #define FRM_OBJ 0x01
 
-void process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
+#define MAX_BO_COUNT 2
+
+int process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
                           struct pi_gpu *gpu, struct pi_exec_buffer *buffer) {
+  int ret = 0;
   switch (flag) {
   case INS_OBJ:
     *(gpu->vram + INS_BUFFER_OFFSET) = get_64_lo(addr);
@@ -42,8 +47,35 @@ void process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
     *(gpu->vram + FRM_BUFFER_LEN_OFFSET) = get_64_lo(size);
     *(gpu->vram + FRM_BUFFER_LEN_OFFSET + 1) = get_64_hi(size);
     break;
+  default:
+    printk(KERN_CRIT "Invalid flag for GEM buffer object"); 
+    ret = -EINVAL;
+    break;
+  }
+  return ret;
+}
+
+
+static inline void init_bo_list(Pair (*obj_adr_list)[MAX_BO_COUNT]) {
+  for (int i = 0; i < MAX_BO_COUNT; i++) {
+    (*obj_adr_list)[i].first = NULL;
+    (*obj_adr_list)[i].second = NULL;
   }
 }
+
+
+// Unmaps the mapping for the Virtual address of the buffer AND decrements the reference of the
+// base of the &drm_gem_shmem_object's base field.
+static void destroy_bo_list(Pair obj_adr_list[MAX_BO_COUNT]) {
+  for (int i = 0; i < MAX_BO_COUNT; i++) {
+    drm_gem_shmem_vunmap(obj_adr_list[i].first, obj_adr_list[i].second);
+
+    struct drm_gem_shmem_object *obj = obj_adr_list[i].first;
+
+    drm_gem_object_put(&obj->base);
+  }
+}
+
 
 /*
  * data argument is a pointer that the kernel already converted for us into the
@@ -70,11 +102,22 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
     return -ENODEV;
 
   struct pi_exec_buffer *args = data;
+
+  if (args->num_buffers > MAX_BO_COUNT)
+    return -EINVAL;
+
   struct page **pages;
   struct sg_table *table;
   struct drm_gem_shmem_object *shmem_obj;
 
   struct iosys_map *bo_va;
+
+
+  // Pair of <drm_gem_shmem_object *, iosys_map *>
+  Pair obj_adr_pair;
+  Pair obj_adr_list[MAX_BO_COUNT];
+  init_bo_list(&obj_adr_list);
+
   size_t bo_size = 0;
   int ret;
   u32 handle;
@@ -96,7 +139,10 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
     goto release;
 
   for (int i = 0; i < args->num_buffers; i++) {
+
     handle = (bo_ptr + i)->handle;
+
+    // NOTE: Need to decrement reference count after caling this function
     struct drm_gem_object *obj = drm_gem_object_lookup(file, handle);
 
     if (IS_ERR(obj))
@@ -107,12 +153,22 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
     if (IS_ERR(shmem_obj))
       return -EINVAL;
 
+    obj_adr_pair.first = shmem_obj;
+
     bo_size = shmem_obj->base.size;
-    // This pins the pages into memory
+
+    // Essentially pins the pages in memory
+    // Gets a scatter gather list
+    // Maps the memory into virtual addresses
     ret = drm_gem_shmem_vmap(shmem_obj, bo_va);
 
     if (ret)
       return ret;
+
+    obj_adr_pair.second = bo_va;
+    obj_adr_list[i] = obj_adr_pair;
+
+    // Add object address 
 
     if (bo_va->is_iomem) {
       printk(KERN_CRIT "Not supposed to be io mem\n");
@@ -129,12 +185,14 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
     va = bo_va->vaddr;
     addr = (unsigned long)va;
 
-    process_gem_exec_obj(addr, bo_size, bo_ptr->flag, gpu, args);
+    ret = process_gem_exec_obj(addr, bo_size, bo_ptr->flag, gpu, args);
+    if (ret)
+      goto unmap_release;
   }
 
-  // execute_bfr();
+  // TODO: execute_bfr();
 unmap_release:
-  drm_gem_shmem_vunmap(shmem_obj, bo_va);
+  destroy_bo_list(obj_adr_list);
 release:
   kfree(bo_ptr);
 

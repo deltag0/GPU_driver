@@ -30,6 +30,12 @@
 struct pi_gpu;
 
 
+typedef struct pair {
+  void *first;
+  void *second;
+} Pair;
+
+
 struct pi_exec_buffer {
   __u64 buffers;     // pointer to buffer objects of type &pi_exec_buffer_obj
   __u32 num_buffers; // number of buffer objects;
@@ -67,7 +73,7 @@ struct pi_exec_buffer_obj {
 };
 
 
-void process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
+int process_gem_exec_obj(unsigned long addr, size_t size, u8 flag,
                           struct pi_gpu *gpu, struct pi_exec_buffer *buffer);
 
 int gpu_render_ioctl(struct drm_device *dev, void *data,
