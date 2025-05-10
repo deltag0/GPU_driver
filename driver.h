@@ -22,6 +22,7 @@
 #define get_64_hi(val) ((val >> 32) & 0xFFFFFFFF)
 
 #define GPU_ID 0x0000 // temporary offset for the ID register for now
+#define NUM_PLANES 2
 
 
 // This is the main device the driver will be for.
@@ -40,9 +41,12 @@ struct pi_gpu {
   // RAM memory for the device
   u32 *vram;
   size_t vram_size;
-  struct clk *clk;
+  struct iosys_map render_addr;
+  struct iosys_map display_addr;
 
-  struct drm_plane primary_plane;
+  // plane[0] -> Primary plane
+  // plane[1] -> Render plane
+  struct drm_plane planes[2];
   struct drm_connector connector;
   struct drm_encoder encoder;
   struct drm_crtc crtc;

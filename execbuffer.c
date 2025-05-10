@@ -110,7 +110,7 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
   struct sg_table *table;
   struct drm_gem_shmem_object *shmem_obj;
 
-  struct iosys_map *bo_va;
+  struct iosys_map bo_va;
 
 
   // Pair of <drm_gem_shmem_object *, iosys_map *>
@@ -160,17 +160,17 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
     // Essentially pins the pages in memory
     // Gets a scatter gather list
     // Maps the memory into virtual addresses
-    ret = drm_gem_shmem_vmap(shmem_obj, bo_va);
+    ret = drm_gem_shmem_vmap(shmem_obj, &bo_va);
 
     if (ret)
       return ret;
 
-    obj_adr_pair.second = bo_va;
+    obj_adr_pair.second = &bo_va;
     obj_adr_list[i] = obj_adr_pair;
 
     // Add object address 
 
-    if (bo_va->is_iomem) {
+    if (bo_va.is_iomem) {
       printk(KERN_CRIT "Not supposed to be io mem\n");
       goto unmap_release;
     }
@@ -182,7 +182,7 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
       goto unmap_release;
     }
 
-    va = bo_va->vaddr;
+    va = bo_va.vaddr;
     addr = (unsigned long)va;
 
     ret = process_gem_exec_obj(addr, bo_size, bo_ptr->flag, gpu, args);

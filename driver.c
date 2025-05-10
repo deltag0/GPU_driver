@@ -46,7 +46,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Victor");
 MODULE_DESCRIPTION("GPU driver for the rasberry pi");
 
-
 #define PI_MAX_PITCH                                                           \
   (0x1FF << 3) /* (4096 - 1) & ~111b bytes                                     \
                 = 4088. It's made sure that it's a multiple of 8 for easier    \
@@ -54,7 +53,6 @@ MODULE_DESCRIPTION("GPU driver for the rasberry pi");
                 */
 #define PI_MAX_VRAM                                                            \
   (4 * 1024 * 1024) /* 4MB since 1024 bytes is a KB and 1024 KB is a MB */
-
 
 // NOTE: We only need to define our cutom iocts like this.
 // So all the ioctls in the .iocts field in drm_driver are custom ones, WE
@@ -70,12 +68,10 @@ static int remove_fake_gpu(struct platform_device *);
 static void pi_format_set(struct pi_gpu *gpu,
                           const struct drm_format_info *format);
 
-
 static const struct drm_ioctl_desc ioctl_funcs[] = {
     DRM_IOCTL_DEF_DRV(EXC_BUFFER_IOCTL, gpu_render_ioctl, DRM_RENDER_ALLOW),
     // TODO: more if needed
 };
-
 
 static const struct drm_driver pi_gpu_driver = {
     .driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER,
@@ -110,7 +106,6 @@ static struct platform_driver pi_connection_driver = {
     .remove = remove_fake_gpu,
 
 };
-
 
 #define to_pi(_dev) container_of(_dev, struct pi_gpu, drm_device)
 /*
@@ -164,7 +159,6 @@ static void reg_write32_ioctl(u32 data, u64 offset) { ; }
 struct pi_gpu *to_gpu(struct drm_device *drm) {
   return container_of_const(drm, struct pi_gpu, drm_device);
 }
-
 
 // -------------------------------------------------
 static const struct drm_mode_config_funcs fake_gpu_modecfg_funcs = {
@@ -331,15 +325,22 @@ pi_format(const struct drm_framebuffer *fb) {
 static int
 pi_primary_plane_helper_atomic_check(struct drm_plane *plane,
                                      struct drm_atomic_state *state) {
+
+  struct pi_gpu *gpu = to_gpu(state->dev);
   // This is the plane state that we want to commit
   struct drm_plane_state *new_plane_state =
       drm_atomic_get_new_plane_state(state, plane);
+
+  struct drm_plane_state *old_plane_state =
+      drm_atomic_get_old_plane_state(state, plane);
 
   // Still the plane state we want to commit but with our struct
   struct pi_primary_plane_state *pp_state =
       to_pi_primary_plane(new_plane_state);
 
-  struct drm_framebuffer *fb = new_plane_state->fb;
+  struct drm_framebuffer *display_fb = new_plane_state->fb;
+  struct drm_framebuffer *render_fb = old_plane_state->fb;
+
   struct drm_crtc *new_crtc = new_plane_state->crtc;
   struct drm_crtc_state *new_crtc_state = NULL;
   int ret = 0;
@@ -366,17 +367,17 @@ pi_primary_plane_helper_atomic_check(struct drm_plane *plane,
     return 0;
   }
 
-  pitch = pi_pitch(fb);
+  pitch = pi_pitch(display_fb);
   if (pitch > PI_MAX_PITCH) {
     return -EINVAL;
-  } else if (pitch * fb->height > PI_MAX_VRAM) {
+  } else if (pitch * display_fb->height > PI_MAX_VRAM) {
     return -EINVAL;
   }
 
   // In this case, we know that the pitch was already fine, or the pitch was
   // successfully converted, so we modify the state from the actual commit to
   // make sure that the correct one is selected
-  pp_state->format = pi_format(fb);
+  pp_state->format = pi_format(display_fb);
   pp_state->pitch = pitch;
   return 0;
 }
@@ -384,6 +385,7 @@ pi_primary_plane_helper_atomic_check(struct drm_plane *plane,
 static void
 pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
                                       struct drm_atomic_state *state) {
+  int ret;
   struct pi_gpu *gpu = to_pi(plane->dev);
   struct drm_plane_state *plane_state =
       drm_atomic_get_new_plane_state(state, plane);
@@ -391,7 +393,7 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
   // I think this should just be the same as doing pp_state->base
   struct drm_shadow_plane_state *shadow_state =
       to_drm_shadow_plane_state(plane_state);
-  struct drm_framebuffer *fb = plane_state->fb;
+  struct drm_framebuffer *display_fb = plane_state->fb;
 
   const struct drm_format_info *format = pp_state->format;
   unsigned int pitch = pp_state->pitch;
@@ -401,6 +403,9 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
   struct drm_plane_state *old_state =
       drm_atomic_get_old_plane_state(state, plane);
   struct pi_primary_plane_state *old_pp_state = to_pi_primary_plane(old_state);
+
+  struct drm_framebuffer *render_fb = old_state->fb;
+
   // inits an iosys_map struct, specifying that we have system memory, no I/O
   // memory
   struct iosys_map vaddr = IOSYS_MAP_INIT_VADDR(gpu->vram);
@@ -416,7 +421,7 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
   struct drm_rect damage;
   int idx = 0;
 
-  if (!fb) {
+  if (!display_fb) {
     return;
   }
 
@@ -432,19 +437,61 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
   if (old_pp_state->pitch != pitch) {
   }
 
-  drm_atomic_helper_damage_iter_init(&iter, old_state, plane_state);
-  drm_atomic_for_each_plane_damage(&iter, &damage) {
-    // Calculate where the start of the dirty area is. Need the pitch for the
-    // width bytes needed, format for bytes/pixel and of course where the area
-    // is.
-    unsigned int offset = drm_fb_clip_offset(pitch, format, &damage);
-    struct iosys_map dst = IOSYS_MAP_INIT_OFFSET(&vaddr, offset);
+  // drm_atomic_helper_damage_iter_init(&iter, old_state, plane_state);
+  // drm_atomic_for_each_plane_damage(&iter, &damage) {
+  //   // Calculate where the start of the dirty area is. Need the pitch for the
+  //   // width bytes needed, format for bytes/pixel and of course where the
+  //   area
+  //   // is.
+  //   unsigned int offset = drm_fb_clip_offset(pitch, format, &damage);
+  //   struct iosys_map dst = IOSYS_MAP_INIT_OFFSET(&vaddr, offset);
 
-    // TODO: fb_blit only actually writes to the dispaly memory which I'm not
-    // sure what it is exactly
-    drm_fb_blit(&dst, &pitch, format->format, shadow_state->data, fb, &damage);
-  }
+  //   // TODO: fb_blit only actually writes to the display memory
+  //
+  //   drm_fb_blit(&dst, &pitch, format->format, shadow_state->data, fb,
+  //   &damage);
+  // }
   drm_dev_exit(idx);
+}
+
+/*
+ * Pretty straightforward check function, as we only check
+ * if the CRTC is enabled or not. If it's not, there can't be a problem.
+ * The only other check is checking whether the CRTC has a primary plane.
+ *
+ */
+static int pi_crtc_helper_atomic_check(struct drm_crtc *crtc,
+                                       struct drm_atomic_state *state) {
+  struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
+  int ret;
+
+  if (!new_state->enable)
+    return 0;
+
+  ret = drm_atomic_helper_check_crtc_primary_plane(new_state);
+  if (ret)
+    return ret;
+
+  return 0;
+}
+
+
+static void pi_crtc_helper_atomic_flush(struct drm_crtc *crtc,
+                                        struct drm_atomic_state *state) {
+  // Update our display buffer
+  struct pi_gpu *gpu = to_gpu(crtc->dev);
+
+  struct pi_primary_plane_state *ppp_display =
+      to_pi_primary_plane(crtc->primary->state);
+  struct pi_primary_plane_state *ppp_render =
+      to_pi_primary_plane(gpu->planes[1].state);
+
+  u8 *display_addr = ppp_display->base.data[0].vaddr;
+  u8 *render_addr = ppp_render->base.data[0].vaddr;
+  unsigned int len =
+      ppp_display->base.base.fb->pitches[0] * ppp_display->base.base.fb->height;
+
+  memcpy(ppp_display, ppp_render, len);
 }
 
 /*-------------------------------------------------------------------------------
@@ -533,7 +580,10 @@ static const struct drm_plane_helper_funcs pi_primary_plane_helper_funcs = {
     .atomic_update = pi_primary_plane_helper_atomic_update,
 };
 
-static struct drm_crtc_helper_funcs pi_crtc_helper_funcs = {};
+static struct drm_crtc_helper_funcs pi_crtc_helper_funcs = {
+    .atomic_check = pi_crtc_helper_atomic_check,
+    .atomic_flush = pi_crtc_helper_atomic_flush,
+};
 
 static const uint32_t pi_primary_plane_formats[] = {
     DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB888, DRM_FORMAT_RGB565};
@@ -594,18 +644,23 @@ static int pi_pipe_init(struct pi_gpu *gpu) {
    * framebuffers or are inactive
    */
   ret = drm_universal_plane_init(
-      drm, &gpu->primary_plane, 0, &pi_primary_plane_funcs,
+      drm, &(gpu->planes[0]), 0, &pi_primary_plane_funcs,
       pi_primary_plane_formats, ARRAY_SIZE(pi_primary_plane_formats),
       pi_primary_plane_modifiers, DRM_PLANE_TYPE_PRIMARY, NULL);
   if (ret)
     return ret;
 
-  drm_plane_helper_add(&gpu->primary_plane, &pi_primary_plane_helper_funcs);
+  drm_plane_helper_add(&(gpu->planes[0]), &pi_primary_plane_helper_funcs);
 
   /*
    * This enables tracking the damage rectangles for updating the output
    */
-  drm_plane_enable_fb_damage_clips(&gpu->primary_plane);
+  drm_plane_enable_fb_damage_clips(&(gpu->planes[0]));
+
+  ret = drm_universal_plane_init(
+      drm, &(gpu->planes[1]), 0, &pi_primary_plane_funcs,
+      pi_primary_plane_formats, ARRAY_SIZE(pi_primary_plane_formats),
+      pi_primary_plane_modifiers, DRM_PLANE_TYPE_OVERLAY, NULL);
 
   /*
    * The first NULL is for the cursor plane
@@ -613,7 +668,7 @@ static int pi_pipe_init(struct pi_gpu *gpu) {
    * NOTE: CRTC is owned by the device, so still exists even if there's no
    * planes pointing to it
    */
-  ret = drmm_crtc_init_with_planes(drm, &gpu->crtc, &gpu->primary_plane, NULL,
+  ret = drmm_crtc_init_with_planes(drm, &gpu->crtc, &(gpu->planes[0]), NULL,
                                    &pi_crtc_funcs, NULL);
 
   if (ret) {
