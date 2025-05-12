@@ -1,12 +1,11 @@
 #include "asm-generic/errno-base.h"
 #include "asm-generic/int-ll64.h"
+
 #include "drm/drm_atomic.h"
 #include "drm/drm_atomic_helper.h"
 #include "drm/drm_crtc.h"
-#include "drm/drm_damage_helper.h"
 #include "drm/drm_device.h"
 #include "drm/drm_drv.h"
-#include "drm/drm_encoder.h"
 #include "drm/drm_format_helper.h"
 #include "drm/drm_fourcc.h"
 #include "drm/drm_framebuffer.h"
@@ -18,7 +17,8 @@
 #include "drm/drm_mode_config.h"
 #include "drm/drm_modeset_helper_vtables.h"
 #include "drm/drm_plane.h"
-#include "drm/drm_simple_kms_helper.h"
+#include "drm/drm_probe_helper.h"
+
 #include "linux/clk.h"
 #include "linux/container_of.h"
 #include "linux/device.h"
@@ -31,13 +31,10 @@
 #include "linux/kernel.h"
 #include "linux/of.h"
 #include "linux/of_address.h"
-#include "linux/of_graph.h"
 #include "linux/of_reserved_mem.h"
 #include "linux/printk.h"
 #include "linux/slab.h"
-#include "linux/uaccess.h"
-#include "linux/workqueue.h"
-#include <linux/platform_device.h>
+#include "linux/platform_device.h"
 
 #include "driver.h"
 #include "execbuffer.h"
@@ -67,6 +64,8 @@ static int probe_fake_gpu(struct platform_device *);
 static int remove_fake_gpu(struct platform_device *);
 static void pi_format_set(struct pi_gpu *gpu,
                           const struct drm_format_info *format);
+static void pi_pitch_set(struct pi_gpu *gpu, unsigned int pitch);
+static int pi_gpu_unload(struct drm_device *drm);
 
 static const struct drm_ioctl_desc ioctl_funcs[] = {
     DRM_IOCTL_DEF_DRV(EXC_BUFFER_IOCTL, gpu_render_ioctl, DRM_RENDER_ALLOW),
@@ -100,7 +99,7 @@ static struct platform_driver pi_connection_driver = {
     // same name
     .driver =
         {
-            .name = "fake_gpu",
+            .name = "pi_gpu",
         },
     .probe = probe_fake_gpu,
     .remove = remove_fake_gpu,
@@ -126,35 +125,16 @@ struct pi_primary_plane_state {
   unsigned int pitch;
 };
 
-// TODO: STEP AFTER PROBE
-// Seems like we'll need to call the predefined function device_register() (in
-// base/probe.c) to register our device Our device is discovered by some bus
-// driver, and it should initialize these fields: -parent -name -bus_id
-//  -bus
-static int register_pi_gpu(struct device *pi_gpu) { return 0; }
 
-static int remove_fake_gpu(struct platform_device *pdev) { return 0; }
+static int remove_fake_gpu(struct platform_device *pdev) {
+  struct drm_device *drm = platform_get_drvdata(pdev);
 
-/* ---------------------------------------------------
-Emulating a GPU with QEMU yourself is actually very hard.
-So, we'll be intercepting GPU calls ourselves. :( Not a real GPU I know
-------------------------------------------------------
-*/
+  drm_dev_unregister(drm);
+  pi_gpu_unload(drm);
 
-static u8 reg_read8_ioctl(struct file *file, unsigned int cmd, u8 data,
-                          u64 offset) {
   return 0;
 }
 
-static u16 reg_read16_ioctl(u16 data, u64 offset) { return 0; }
-
-static u32 reg_read32_ioctl(u32 data, u64 offset) { return 0; }
-
-static void reg_write8_ioctl(u8 data, u64 offset) { ; }
-
-static void reg_write16_ioctl(u16 data, u64 offset) { ; }
-
-static void reg_write32_ioctl(u32 data, u64 offset) { ; }
 
 struct pi_gpu *to_gpu(struct drm_device *drm) {
   return container_of_const(drm, struct pi_gpu, drm_device);
@@ -326,20 +306,15 @@ static int
 pi_primary_plane_helper_atomic_check(struct drm_plane *plane,
                                      struct drm_atomic_state *state) {
 
-  struct pi_gpu *gpu = to_gpu(state->dev);
   // This is the plane state that we want to commit
   struct drm_plane_state *new_plane_state =
       drm_atomic_get_new_plane_state(state, plane);
-
-  struct drm_plane_state *old_plane_state =
-      drm_atomic_get_old_plane_state(state, plane);
 
   // Still the plane state we want to commit but with our struct
   struct pi_primary_plane_state *pp_state =
       to_pi_primary_plane(new_plane_state);
 
   struct drm_framebuffer *display_fb = new_plane_state->fb;
-  struct drm_framebuffer *render_fb = old_plane_state->fb;
 
   struct drm_crtc *new_crtc = new_plane_state->crtc;
   struct drm_crtc_state *new_crtc_state = NULL;
@@ -385,14 +360,15 @@ pi_primary_plane_helper_atomic_check(struct drm_plane *plane,
 static void
 pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
                                       struct drm_atomic_state *state) {
-  int ret;
   struct pi_gpu *gpu = to_pi(plane->dev);
   struct drm_plane_state *plane_state =
       drm_atomic_get_new_plane_state(state, plane);
   struct pi_primary_plane_state *pp_state = to_pi_primary_plane(plane_state);
+
   // I think this should just be the same as doing pp_state->base
-  struct drm_shadow_plane_state *shadow_state =
-      to_drm_shadow_plane_state(plane_state);
+  // struct drm_shadow_plane_state *shadow_state =
+  //     to_drm_shadow_plane_state(plane_state);
+
   struct drm_framebuffer *display_fb = plane_state->fb;
 
   const struct drm_format_info *format = pp_state->format;
@@ -404,11 +380,9 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
       drm_atomic_get_old_plane_state(state, plane);
   struct pi_primary_plane_state *old_pp_state = to_pi_primary_plane(old_state);
 
-  struct drm_framebuffer *render_fb = old_state->fb;
-
   // inits an iosys_map struct, specifying that we have system memory, no I/O
   // memory
-  struct iosys_map vaddr = IOSYS_MAP_INIT_VADDR(gpu->vram);
+  // struct iosys_map vaddr = IOSYS_MAP_INIT_VADDR(gpu->vram);
 
   /*
    * In graphics rendering, damage is the parts of a framebuffer that have been
@@ -417,8 +391,8 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
    *
    * It keeps track of the parts it needs to re-render in rectangles
    */
-  struct drm_atomic_helper_damage_iter iter;
-  struct drm_rect damage;
+  // struct drm_atomic_helper_damage_iter iter;
+  // struct drm_rect damage;
   int idx = 0;
 
   if (!display_fb) {
@@ -435,6 +409,7 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
     pi_format_set(gpu, format);
   }
   if (old_pp_state->pitch != pitch) {
+    pi_pitch_set(gpu, pitch);
   }
 
   // drm_atomic_helper_damage_iter_init(&iter, old_state, plane_state);
@@ -446,7 +421,7 @@ pi_primary_plane_helper_atomic_update(struct drm_plane *plane,
   //   unsigned int offset = drm_fb_clip_offset(pitch, format, &damage);
   //   struct iosys_map dst = IOSYS_MAP_INIT_OFFSET(&vaddr, offset);
 
-  //   // TODO: fb_blit only actually writes to the display memory
+  //   // TODO: purpose of the blit was to write to display memory
   //
   //   drm_fb_blit(&dst, &pitch, format->format, shadow_state->data, fb,
   //   &damage);
@@ -475,7 +450,6 @@ static int pi_crtc_helper_atomic_check(struct drm_crtc *crtc,
   return 0;
 }
 
-
 static void pi_crtc_helper_atomic_flush(struct drm_crtc *crtc,
                                         struct drm_atomic_state *state) {
   // Update our display buffer
@@ -486,16 +460,16 @@ static void pi_crtc_helper_atomic_flush(struct drm_crtc *crtc,
   struct pi_primary_plane_state *ppp_render =
       to_pi_primary_plane(gpu->planes[1].state);
 
-  u8 *display_addr = ppp_display->base.data[0].vaddr;
-  u8 *render_addr = ppp_render->base.data[0].vaddr;
+  void *display_addr = ppp_display->base.data[0].vaddr;
+  void *render_addr = ppp_render->base.data[0].vaddr;
   unsigned int len =
       ppp_display->base.base.fb->pitches[0] * ppp_display->base.base.fb->height;
 
-  memcpy(ppp_display, ppp_render, len);
+  memcpy(display_addr, render_addr, len);
 }
 
 /*-------------------------------------------------------------------------------
- * Most device specific features
+ * Some more specific features
  *
  *
  *-------------------------------------------------------------------------------
@@ -529,8 +503,6 @@ static void pi_format_set(struct pi_gpu *gpu,
     return;
   }
 
-  // TODO: important, I think we'll actually have to make our GPU with QEMU,
-  // otherwise, it's going to be hard as hell
   iowrite8(fmt, gpu->registers + REG_FORMAT);
 }
 
@@ -583,6 +555,7 @@ static const struct drm_plane_helper_funcs pi_primary_plane_helper_funcs = {
 static struct drm_crtc_helper_funcs pi_crtc_helper_funcs = {
     .atomic_check = pi_crtc_helper_atomic_check,
     .atomic_flush = pi_crtc_helper_atomic_flush,
+    .mode_set_nofb = NULL, // TODO:
 };
 
 static const uint32_t pi_primary_plane_formats[] = {
@@ -604,8 +577,6 @@ static const struct drm_crtc_funcs pi_crtc_funcs = {
 static int pi_pipe_init(struct pi_gpu *gpu) {
   struct drm_device *drm = &gpu->drm_device;
   struct drm_crtc *crtc = NULL;
-  struct drm_encoder *enconder = NULL;
-  struct drm_connector *connector = NULL;
   int ret = 0;
 
   /*
@@ -692,12 +663,8 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
   // since we're emulating, we can't really use it, because it's meant for a
   // device to write to the actual physical mapping (unless there's more
   // hardware that does some mapping (but still in hardware))
-  dma_addr_t dma_handle_vram;
 
   int ret = 0;
-
-  // TODO:We'll look at this next time
-  struct device_node *encoder_node = NULL, *enpointnode = NULL;
 
   /* devm_clk_get gets a clock for the device. Aside: Power-aware drivers only
    * update the clocks when the device they manage is in actve use
@@ -732,9 +699,11 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
   drm->mode_config.min_height = 0;
   drm->mode_config.min_width = 0;
   drm->mode_config.max_height = 1080;
-  drm->mode_config.max_width = 1920;
+  /*
+   * Divide by 2 because the smallest Bpp we have is 2
+   */
+  drm->mode_config.max_width = PI_MAX_PITCH / 2;
   drm->mode_config.funcs = &fake_gpu_modecfg_funcs;
-  // TODO: something with drm_mode_config_init() ?
 
   /*
    * resources have a start address and a size
@@ -749,6 +718,10 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
    * because in code we're using virtual addresses, so we'll have no idea what
    * to do. using devm_ioremp_resource, we get back virtual addresses pointing
    * to the physical addresses
+   *
+   * This needs to be backed by a reserved memory region since there's no actual
+   * device. Like in test.dts there's the reg region backed by it.
+   *
    */
   res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 
@@ -842,7 +815,7 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
     return -EINVAL;
   }
 
-  gpu->vram = dma_alloc_coherent(drm->dev, (size_t)vram_size, &dma_handle_vram,
+  gpu->vram = dma_alloc_coherent(drm->dev, (size_t)vram_size, &gpu->dma_handle_vram,
                                  GFP_KERNEL);
   gpu->vram_size = (size_t)vram_size;
 
@@ -874,6 +847,21 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
   // }
 
   ret = pi_pipe_init(gpu);
+
+  if (ret)
+    return ret;
+
+  drm_mode_config_reset(drm);
+  platform_set_drvdata(pdev, drm);
+  return 0;
+}
+
+static int pi_gpu_unload(struct drm_device *drm) {
+  struct pi_gpu *pi_device = to_gpu(drm);
+  dma_free_coherent(drm->dev, pi_device->vram_size, pi_device->vram, pi_device->dma_handle_vram);
+  drm_kms_helper_poll_fini(drm);
+  drm_atomic_helper_shutdown(drm);
+
   return 0;
 }
 
@@ -898,8 +886,6 @@ static int probe_fake_gpu(struct platform_device *device) {
   // device) which is the actual existing hardware device
   pi_device = devm_drm_dev_alloc(&(device->dev), &pi_gpu_driver, struct pi_gpu,
                                  drm_device);
-  ret = fake_gpu_load(pi_device);
-
   // IS_ERR returns true if the pointer passed is an error pointer
   // Since devm_dr_devl_alloc returns an error pointer, this is good use
   if (IS_ERR(pi_device)) {
@@ -907,13 +893,23 @@ static int probe_fake_gpu(struct platform_device *device) {
     return PTR_ERR(pi_device);
   }
 
-  struct resource *res = NULL;
-  void __iomem *reg_base;
-  res = platform_get_resource(device, IORESOURCE_MEM, 0);
-  if (!res) {
-    return -EFAULT;
+  ret = fake_gpu_load(pi_device);
+
+  if (ret) {
+    dma_free_coherent(&device->dev, pi_device->vram_size, pi_device->vram, pi_device->dma_handle_vram);
+    return ret;
   }
+
+
+  ret = drm_dev_register(&(pi_device->drm_device), 0);
+  if (ret)
+    goto err_unload;
+
   return 0;
+
+err_unload:
+  pi_gpu_unload(&(pi_device->drm_device));
+  return ret;
 }
 
 module_platform_driver(pi_connection_driver);

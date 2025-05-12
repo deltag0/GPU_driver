@@ -106,8 +106,6 @@ int gpu_render_ioctl(struct drm_device *dev, void *data,
   if (args->num_buffers > MAX_BO_COUNT)
     return -EINVAL;
 
-  struct page **pages;
-  struct sg_table *table;
   struct drm_gem_shmem_object *shmem_obj;
 
   struct iosys_map bo_va;

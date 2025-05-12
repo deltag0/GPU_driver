@@ -13,7 +13,6 @@
 #include "drm/drm_ioctl.h"
 #include "drm/drm_mode_config.h"
 #include "drm/drm_plane.h"
-#include "linux/clk.h"
 #include <linux/platform_device.h>
 
 
@@ -40,6 +39,8 @@ struct pi_gpu {
   // below on why it's RAM) so I'll have to add an offset when allocating the
   // RAM memory for the device
   u32 *vram;
+  // Unused since there's no actual DMA, but here for the future
+  dma_addr_t dma_handle_vram;
   size_t vram_size;
   struct iosys_map render_addr;
   struct iosys_map display_addr;
