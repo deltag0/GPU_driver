@@ -1,9 +1,9 @@
 *.ko*
-*.o*
+**/*.o*
 *.mod*
 *.order
 *.symvers*
 *.Module*
 *.cache
-*.json
+**/*.json
 

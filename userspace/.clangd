@@ -1,0 +1,11 @@
+Index:
+  Background: Build
+  
+CompileFlags:
+  Add:
+    - "-I/usr/include/drm"
+
+Diagnostics:
+  Suppress:
+    - unused-parameter
+    - missing-prototypes

@@ -796,6 +796,7 @@ static int fake_gpu_load(struct pi_gpu *gpu) {
   }
 
   ret = of_address_to_resource(res_node, 0, &vram);
+  of_node_put(res_node);
 
   if (ret) {
     return -ENODEV;
