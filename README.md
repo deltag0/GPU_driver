@@ -11,8 +11,8 @@ A minimal GPU driver and software rasterizer. Built to interface with a basic em
 
 ## Build & Run
 Instructions vary depending on platform, so these are specific for Rasberry Pi 5:
-* Compile test.dts with dtc: dtc -I dts -O dtb -@ -o some_name.dtbo test.dts
-* Place it in /boot/firmware/overlays/
-* In /boot/firmware/overlays/config.txt, add dtoverlay=some_name
-* Compile the driver files using make
-* Load the driver using (sudo) insmod: sudo insmod driver.ko
+* Compile test.dts with dtc: `dtc -I dts -O dtb -@ -o some_name.dtbo test.dts`
+* Place it in `/boot/firmware/overlays/`
+* In `/boot/firmware/overlays/config.txt`, add `dtoverlay=some_name`
+* Compile the driver files using `make`
+* Load the driver using (sudo) insmod: `sudo insmod driver.ko`
